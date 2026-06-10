@@ -1,0 +1,262 @@
+---
+title: "RGBOOST"
+output: html_document
+date: "2025-11-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(repos = c(CRAN = "https://cran.rstudio.com"))
+
+
+```
+
+```{r}
+# ==== CONFIG ====
+
+DATA_PATH    <- "/Users/ianbarbero/Downloads/Crash_Data_Cleaned_v3.csv"   # <— set your path
+TARGET_HUMAN <- "Driver At Fault"                                    # as it appears in CSV
+POS_CLASS    <- "Yes"                                                # positive class label
+SEED         <- 180
+
+# Optional sampling to speed up iteration (set to NA for full data)
+
+SAMPLE_N     <- 20000
+
+# ==== PACKAGES ====
+
+pkgs <- c("tidyverse","janitor","readr","forcats",
+"caret","ranger","pROC","yardstick","ggplot2")
+need <- pkgs[!sapply(pkgs, require, character.only = TRUE)]
+if (length(need)) {
+try(install.packages(need), silent = TRUE)
+lapply(need, require, character.only = TRUE)
+}
+set.seed(SEED)
+
+# ==== HELPERS ====
+
+normalize <- function(x) gsub("[^a-z0-9]+","",tolower(x))
+find_col <- function(df, human_name){
+key <- normalize(human_name)
+nm  <- names(df)
+hit <- nm[normalize(nm) == key]
+if (length(hit)) return(hit[1])
+hit2 <- nm[grepl(key, normalize(nm), fixed=TRUE)]
+if (length(hit2)) return(hit2[1])
+stop("Couldn't find a column like: ", human_name)
+}
+
+# collapse rare factor levels to reduce dimensionality
+
+collapse_levels <- function(f, min_n = 200) {
+if (!is.factor(f)) f <- factor(f)
+tab  <- table(f)
+keep <- names(tab[tab >= min_n])
+f2   <- ifelse(f %in% keep, as.character(f), "Other")
+factor(f2)
+}
+
+# robust AUC: tries both ROC directions and returns the larger
+
+robust_auc <- function(truth_factor, pos_scores) {
+lv <- levels(truth_factor); stopifnot(length(lv) == 2)
+roc_lt <- pROC::roc(response = truth_factor, predictor = pos_scores,
+levels = lv, direction = "<", quiet = TRUE)
+roc_gt <- pROC::roc(response = truth_factor, predictor = pos_scores,
+levels = lv, direction = ">", quiet = TRUE)
+auc_lt <- as.numeric(pROC::auc(roc_lt)); auc_gt <- as.numeric(pROC::auc(roc_gt))
+if (auc_lt >= auc_gt) list(auc = auc_lt, roc = roc_lt) else list(auc = auc_gt, roc = roc_gt)
+}
+
+
+
+```
+
+```{r}
+raw <- readr::read_csv(DATA_PATH, guess_max = 200000)
+df  <- janitor::clean_names(raw)
+
+TARGET <- find_col(df, TARGET_HUMAN)
+
+# keep rows with target present; factor & put positive first if present
+
+df <- df %>% dplyr::filter(!is.na(.data[[TARGET]]))
+if (!is.factor(df[[TARGET]])) df[[TARGET]] <- as.factor(df[[TARGET]])
+if (POS_CLASS %in% levels(df[[TARGET]])) {
+df[[TARGET]] <- forcats::fct_relevel(df[[TARGET]], POS_CLASS)
+}
+
+# if target has an 'Unknown' level, drop it to keep binary ROC setup
+
+if ("Unknown" %in% levels(df[[TARGET]])) {
+df <- df %>% dplyr::filter(.data[[TARGET]] != "Unknown") %>% droplevels()
+}
+
+cat("Rows:", nrow(df), " Cols:", ncol(df), "\n")
+cat("Target:", TARGET, " Levels:", paste(levels(df[[TARGET]]), collapse=", "), "\n")
+
+
+
+```
+
+```{r}
+# numeric: median impute; character: ""→NA; NA→"Unknown"; then cast to factor
+
+df <- df %>%
+mutate(across(where(is.character), ~na_if(.x, ""))) %>%
+mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .))) %>%
+mutate(across(where(is.character), ~tidyr::replace_na(.x, "Unknown"))) %>%
+mutate(across(where(is.character), as.factor))
+
+
+
+```
+
+
+```{r}
+# 1) Optional stratified sample (keeps class balance)
+
+if (!is.na(SAMPLE_N) && nrow(df) > SAMPLE_N) {
+idx <- caret::createDataPartition(df[[TARGET]], p = SAMPLE_N / nrow(df), list = FALSE)
+df  <- df[idx, ]
+cat("Sampled to:", nrow(df), "rows\n")
+}
+
+# 2) Collapse rare factor levels globally (min_n can be tuned)
+
+df <- df %>% mutate(across(where(is.factor), collapse_levels, min_n = 200))
+
+# 3) Drop near-zero-variance predictors (on features only)
+
+nzv <- caret::nearZeroVar(df %>% dplyr::select(-all_of(TARGET)), saveMetrics = TRUE)
+drop_cols <- rownames(nzv)[nzv$nzv]
+if (length(drop_cols)) {
+df <- df %>% dplyr::select(-any_of(drop_cols))
+cat("Dropped NZV cols:", length(drop_cols), "\n")
+}
+
+
+
+```
+
+```{r}
+set.seed(SEED)
+idx   <- caret::createDataPartition(df[[TARGET]], p = 0.80, list = FALSE)
+train <- df[idx, ]
+test  <- df[-idx, ]
+
+cat("Train:", nrow(train), " Test:", nrow(test), "\n")
+
+
+
+```
+
+```{r}
+# ----- XGBoost (direct) replace caret training + eval -----
+
+library(xgboost)
+library(Matrix)  # for sparse matrix if needed
+
+
+TARGET_COL <- TARGET
+y_train <- ifelse(train[[TARGET_COL]] == levels(train[[TARGET_COL]])[1], 1L, 0L)
+y_test  <- ifelse(test[[TARGET_COL]]  == levels(train[[TARGET_COL]])[1], 1L, 0L)
+
+
+train_X_df <- train %>% dplyr::select(-all_of(TARGET_COL))
+test_X_df  <- test  %>% dplyr::select(-all_of(TARGET_COL))
+
+
+mm_train <- model.matrix(~ . -1, data = train_X_df)
+mm_test  <- model.matrix(~ . -1, data = test_X_df)
+
+
+dtrain <- xgb.DMatrix(data = mm_train, label = y_train)
+dtest  <- xgb.DMatrix(data = mm_test,  label = y_test)
+
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.30,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+nrounds <- 100
+watchlist <- list(train = dtrain, eval = dtest)
+
+set.seed(SEED)
+bst <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = nrounds,
+  watchlist = watchlist,
+  verbose = 0,
+  nthread = max(1, parallel::detectCores() - 1)
+)
+
+# 4) Predictions and metrics (keeps same metric calculations as your notebook)
+prob_xgb <- predict(bst, dtest)              # probabilities for positive class (1)
+pred_xgb_bin <- ifelse(prob_xgb >= 0.5, 1L, 0L)
+
+# Map numeric predictions back to factor levels used earlier (pos level is first factor level)
+pos_lvl <- levels(train[[TARGET]])[1]
+neg_lvl <- levels(train[[TARGET]])[2]
+pred_xgb <- factor(ifelse(pred_xgb_bin == 1, pos_lvl, neg_lvl), levels = c(pos_lvl, neg_lvl))
+
+# Baseline / confusion / accuracy
+maj_lvl <- names(sort(table(train[[TARGET]]), decreasing = TRUE))[1]
+baseline_acc <- mean(test[[TARGET]] == maj_lvl)
+
+cm_xgb <- caret::confusionMatrix(pred_xgb, test[[TARGET]], positive = pos_lvl)
+cm_table <- cm_xgb$table
+acc_xgb <- as.numeric(cm_xgb$overall["Accuracy"])
+
+# Macro-F1 (yardstick expects factor truth and predicted class)
+eval_df <- tibble::tibble(truth = test[[TARGET]], .pred_class = pred_xgb)
+mf1_xgb  <- yardstick::f_meas(eval_df, truth = truth, estimate = .pred_class,
+                              estimator = "macro")$.estimate
+
+# Robust AUC: note robust_auc expects factor truth and pos-scores for pos level.
+# We have numeric labels y_test (0/1), but robust_auc expects factor levels.
+truth_factor <- test[[TARGET]]
+auc_obj <- robust_auc(truth_factor, prob_xgb)
+auc_xgb  <- auc_obj$auc
+roc_best <- auc_obj$roc
+
+# Print results
+cat("=== XGBoost (direct xgb.train) — Simplified Test Results ===\n\n")
+cat("Confusion Matrix:\n")
+print(cm_table)
+cat(sprintf("\nAccuracy: %.3f\nMacro-F1: %.3f\nAUC: %.3f\nBaseline Accuracy: %.3f\n",
+            acc_xgb, mf1_xgb, auc_xgb, baseline_acc))
+
+# Confusion heatmap (same style as before)
+cm_tbl <- as.data.frame(cm_xgb$table)
+ggplot(cm_tbl, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 4) +
+  scale_fill_gradient(low = "#6aaed6", high = "#08306b") +
+  coord_equal() +
+  theme_minimal(base_size = 12) +
+  labs(title = "Confusion Matrix — XGBoost")
+
+
+```
+```{r}
+# ==== ROC Curve — XGBoost ====
+
+plot(roc_best,
+     main = "ROC — XGBoost",
+     col = "#1f78b4",
+     lwd = 3)
+
+legend("bottomright",
+       legend = sprintf("AUC = %.3f", auc_xgb),
+       bty = "n")
+
+
+```

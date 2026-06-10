@@ -1,0 +1,446 @@
+---
+title: "Memo 3"
+output: html_document
+date: "2025-11-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(repos = c(CRAN = "https://cran.rstudio.com"))
+
+```
+
+```{r}
+
+# ==== CONFIG & LIBRARIES ====
+
+library(tidyverse)
+library(caret)
+library(ranger)
+library(pROC)
+library(glmnet)
+library(xgboost)
+library(Matrix)
+library(yardstick)  # for macro F1
+set.seed(2024)
+
+
+DATA_PATH <- "/Users/ianbarbero/Downloads/Crash_Data_Cleaned_v3.csv"
+
+
+# Load dataset
+
+df <- read_csv(DATA_PATH, show_col_types = FALSE)
+
+# Optional sampling for speed (set SAMPLE_N <- NA to use full data)
+
+if (!exists("SAMPLE_N")) SAMPLE_N <- NA
+if (!is.na(SAMPLE_N)) {
+df <- df %>% sample_n(SAMPLE_N)
+}
+
+# === AUTO-DETECT TARGET COLUMN (robust) ===
+
+# If you already know the target column name, set TARGET <- "your_column" above this file
+
+if (!exists("TARGET")) TARGET <- "target"  # default attempt
+
+# If default TARGET not present, try common candidate names, then fallback to a binary column auto-detect
+
+if (!(TARGET %in% names(df))) {
+candidates <- c("target","TARGET","Target","injury","Injury","severity","Severity",
+"outcome","Outcome","label","Label","CrashType","crash_type","crash")
+found <- intersect(candidates, names(df))
+if (length(found) > 0) {
+TARGET <- found[1]
+message("TARGET not found as 'target' — using candidate column: ", TARGET)
+} else {
+# find any column with exactly 2 unique non-NA values
+bin_cols <- names(df)[sapply(df, function(x) length(unique(na.omit(x))) == 2)]
+if (length(bin_cols) > 0) {
+TARGET <- bin_cols[1]
+message("Auto-detected binary target column: ", TARGET)
+} else {
+# as last resort, pick a column with few unique values (<=10) and not an ID-like column
+small_cols <- names(df)[sapply(df, function(x) {
+ux <- unique(na.omit(x))
+is.numeric(x) && length(ux) <= 10 || is.character(x) && length(ux) <= 10 || is.factor(x) && length(ux) <= 10
+})]
+if (length(small_cols) > 0) {
+TARGET <- small_cols[1]
+message("No strict binary column found; picking small-unique-values column as target: ", TARGET)
+} else {
+stop("Could not auto-detect a suitable target column. Please set TARGET to the correct column name.")
+}
+}
+}
+} else {
+message("Using TARGET = '", TARGET, "' from config.")
+}
+
+# Print a bit of diagnostic info
+
+cat("DATA PATH:", DATA_PATH, "\n")
+cat("Detected TARGET column:", TARGET, "\n")
+cat("Dataset dims:", dim(df)[1], "rows x", dim(df)[2], "cols\n")
+
+```
+
+```{r}
+
+# ===== Safe train/test split with diagnostics =====
+
+# Basic checks
+
+if (!exists("df")) stop("Error: object 'df' not found. Load your dataset before splitting.")
+if (!exists("TARGET")) stop("Error: TARGET variable not set.")
+
+if (!(TARGET %in% names(df))) {
+stop(paste0("Error: TARGET '", TARGET, "' not found in df. Available columns: ",
+paste(head(names(df), 200), collapse = ", ")))
+}
+
+cat("Dataset rows:", nrow(df), " cols:", ncol(df), "\n")
+if (nrow(df) < 2) stop("Error: dataset has fewer than 2 rows; cannot split.")
+
+# Inspect target column
+
+target_vec <- df[[TARGET]]
+cat("Target column class:", class(target_vec), "\n")
+na_cnt <- sum(is.na(target_vec))
+cat("Target NAs:", na_cnt, "\n")
+
+# Count unique non-NA values
+
+unique_vals <- unique(na.omit(target_vec))
+cat("Unique non-NA target values (n):", length(unique_vals), "\n")
+if (length(unique_vals) == 0) stop("Error: target column contains only NA values.")
+
+# If only one unique value, we cannot train a classifier
+
+if (length(unique_vals) == 1) {
+stop(paste0("Target has only one class: '", unique_vals, "'. Cannot train classification model."))
+}
+
+# Convert target to factor for modelling
+
+df[[TARGET]] <- as.factor(df[[TARGET]])
+cat("Target levels:", paste(levels(df[[TARGET]]), collapse = ", "), "\n")
+
+# Choose positive class: by default choose the minority class (useful for binary classification)
+
+tab <- table(df[[TARGET]])
+pos_class <- names(sort(tab, decreasing = FALSE))[1]  # minority
+cat("Positive class (chosen):", pos_class, "\n")
+
+# Also provide the majority class just for reference
+
+maj_class <- names(sort(tab, decreasing = TRUE))[1]
+cat("Majority class:", maj_class, "\n")
+POS_CLASS <- pos_class  # store for later use
+
+# If any class has fewer than 2 observations, stratified splitting will fail; fallback to random split
+
+if (any(tab < 2)) {
+warning("At least one target class has < 2 observations; falling back to random (non-stratified) split.")
+set.seed(2024)
+train_idx <- sample(seq_len(nrow(df)), size = floor(0.8 * nrow(df)))
+train <- df[train_idx, , drop = FALSE]
+test  <- df[-train_idx, , drop = FALSE]
+} else {
+
+# Stratified split
+
+set.seed(2024)
+train_idx <- caret::createDataPartition(df[[TARGET]], p = 0.8, list = FALSE)
+train <- df[train_idx, , drop = FALSE]
+test  <- df[-train_idx, , drop = FALSE]
+}
+
+cat("Split sizes -> train:", nrow(train), " test:", nrow(test), "\n")
+
+# Ensure target is factor in both
+
+train[[TARGET]] <- factor(train[[TARGET]], levels = levels(df[[TARGET]]))
+test[[TARGET]]  <- factor(test[[TARGET]], levels = levels(df[[TARGET]]))
+```
+
+```{r}
+
+# Basic preprocessing: median impute numeric, replace NA in factors with "Unknown"
+
+numeric_cols <- names(train)[sapply(train, is.numeric)]
+factor_cols  <- names(train)[sapply(train, function(x) is.character(x) || is.factor(x)) & names(train) != TARGET]
+
+if (length(numeric_cols) > 0) {
+for (col in numeric_cols) {
+med <- median(train[[col]], na.rm = TRUE)
+train[[col]][is.na(train[[col]])] <- med
+test[[col]][is.na(test[[col]])]  <- med
+}
+}
+
+if (length(factor_cols) > 0) {
+for (col in factor_cols) {
+# convert to factor and replace NA with "Unknown"
+train[[col]] <- as.character(train[[col]])
+test[[col]]  <- as.character(test[[col]])
+train[[col]][is.na(train[[col]])] <- "Unknown"
+test[[col]][is.na(test[[col]])]  <- "Unknown"
+# collapse rare levels in train (optional)
+lvl_counts <- sort(table(train[[col]]), decreasing = TRUE)
+# keep levels that have at least 1 observation (or change threshold)
+train[[col]] <- factor(train[[col]])
+test[[col]]  <- factor(test[[col]], levels = levels(train[[col]]))
+}
+}
+
+# Remove ID-like columns (simple heuristic: very high cardinality and names like id)
+
+possible_ids <- names(train)[grepl("id|ID|record", names(train), ignore.case = TRUE)]
+if (length(possible_ids) > 0) {
+message("Dropping possible ID columns: ", paste(possible_ids, collapse = ", "))
+train <- train %>% select(-any_of(possible_ids))
+test  <- test %>% select(-any_of(possible_ids))
+}
+
+# Final sanity check: ensure no infinite or NaN values
+
+train <- train %>% mutate(across(everything(), ~ ifelse(is.infinite(.x), NA, .x)))
+test  <- test  %>% mutate(across(everything(), ~ ifelse(is.infinite(.x), NA, .x)))
+```
+
+```{r}
+# === RANDOM FOREST (ranger) ===
+
+
+rf_model <- ranger(
+formula = as.formula(paste(TARGET, "~ .")),
+data = train,
+num.trees = 200,
+probability = TRUE,
+mtry = floor(sqrt(ncol(train) - 1)),
+min.node.size = 10
+)
+
+# Get probability for positive class
+
+preds_rf <- predict(rf_model, data = test)$predictions
+if (is.matrix(preds_rf) || is.data.frame(preds_rf)) {
+if (POS_CLASS %in% colnames(preds_rf)) {
+prob_rf <- preds_rf[, as.character(POS_CLASS)]
+} else {
+# fallback: pick the column corresponding to POS_CLASS by position if names absent
+prob_rf <- preds_rf[, 1]
+warning("Could not find POS_CLASS column in RF predictions; using first column as probability.")
+}
+} else {
+
+# unexpected format
+
+stop("Unexpected prediction format from ranger; inspect rf_model output.")
+}
+
+pred_rf <- factor(ifelse(prob_rf >= 0.5, POS_CLASS, maj_class), levels = c(maj_class, POS_CLASS))
+
+acc_rf <- mean(pred_rf == test[[TARGET]])
+mf1_rf <- yardstick::f_meas_vec(as.factor(test[[TARGET]]), pred_rf, estimator = "macro")
+auc_rf <- pROC::roc(response = test[[TARGET]], predictor = prob_rf, levels = levels(test[[TARGET]]))$auc
+
+cat(sprintf("RF -> Accuracy: %.3f | Macro-F1: %.3f | AUC: %.3f\n", acc_rf, mf1_rf, auc_rf))
+
+```
+
+```{r}
+
+# Ensure packages for glmnet/xgboost are loaded (they were loaded at top, but keep safe)
+
+add_pkgs <- c("glmnet","xgboost","Matrix")
+need2 <- add_pkgs[!sapply(add_pkgs, require, character.only = TRUE)]
+if (length(need2)) { try(install.packages(need2), silent = TRUE); lapply(need2, require, character.only = TRUE) }
+library(glmnet); library(xgboost); library(Matrix)
+set.seed(2024)
+```
+
+```{r}
+
+# === Logistic Regression (caret::train glm) ===
+
+set.seed(2024)
+glm_fit <- caret::train(
+as.formula(paste(TARGET, "~ .")),
+data = train,
+method = "glm",
+family = "binomial",
+trControl = caret::trainControl(method = "none", classProbs = TRUE)
+)
+
+glm_prob_df <- predict(glm_fit, newdata = test, type = "prob")
+
+# pick probability column for POS_CLASS; caret returns a column per level name
+
+if (POS_CLASS %in% names(glm_prob_df)) {
+glm_probs <- glm_prob_df[[as.character(POS_CLASS)]]
+} else {
+
+# fallback: if names differ, take the second column (commonly the "positive" level)
+
+glm_probs <- glm_prob_df[[ncol(glm_prob_df)]]
+warning("POS_CLASS not found in glm prob columns; using last column as probability.")
+}
+
+glm_pred <- factor(ifelse(glm_probs >= 0.5, POS_CLASS, maj_class), levels = c(maj_class, POS_CLASS))
+
+cm_glm <- caret::confusionMatrix(glm_pred, test[[TARGET]], positive = POS_CLASS)
+auc_glm <- pROC::roc(response = test[[TARGET]], predictor = glm_probs, levels = levels(test[[TARGET]]))$auc
+
+cat("GLM results:\n")
+print(cm_glm)
+cat(sprintf("GLM AUC: %.3f\n", as.numeric(auc_glm)))
+```
+
+```{r}
+# === XGBoost via caret (xgbTree) ===
+
+ctrl <- caret::trainControl(
+method = "cv", number = 3,
+classProbs = TRUE,
+summaryFunction = twoClassSummary,
+verboseIter = FALSE
+)
+
+# caret expects the positive class to be the first level of the factor passed to it when using twoClassSummary.
+
+# To make things consistent, relevel train so that POS_CLASS is the first level and majority is second.
+
+train_xgb <- train
+train_xgb[[TARGET]] <- factor(train_xgb[[TARGET]], levels = c(POS_CLASS, setdiff(levels(train_xgb[[TARGET]]), POS_CLASS)))
+
+test_xgb  <- test
+test_xgb[[TARGET]]  <- factor(test_xgb[[TARGET]], levels = levels(train_xgb[[TARGET]]))
+
+tune_grid <- expand.grid(
+nrounds = c(50, 100),
+max_depth = c(3, 6),
+eta = c(0.1, 0.3),
+gamma = 0,
+colsample_bytree = c(0.6, 0.8),
+min_child_weight = 1,
+subsample = c(0.6, 0.8)
+)
+
+set.seed(2024)
+xgb_fit <- caret::train(
+as.formula(paste(TARGET, "~ .")),
+data = train_xgb,
+method = "xgbTree",
+metric = "ROC",
+trControl = ctrl,
+tuneGrid = tune_grid
+)
+
+xgb_prob_df <- predict(xgb_fit, newdata = test_xgb, type = "prob")
+
+# caret returns a column per level; pick the POS_CLASS column (if present) or the first column
+
+if (POS_CLASS %in% names(xgb_prob_df)) {
+xgb_probs <- xgb_prob_df[[as.character(POS_CLASS)]]
+} else {
+xgb_probs <- xgb_prob_df[[1]]
+warning("POS_CLASS not found in xgb prob columns; using first column as probability.")
+}
+
+xgb_pred <- factor(ifelse(xgb_probs >= 0.5, POS_CLASS, maj_class), levels = c(maj_class, POS_CLASS))
+
+cm_xgb <- caret::confusionMatrix(xgb_pred, test_xgb[[TARGET]], positive = POS_CLASS)
+auc_xgb <- pROC::roc(response = test_xgb[[TARGET]], predictor = xgb_probs, levels = levels(test_xgb[[TARGET]]))$auc
+
+cat("XGBoost bestTune:\n")
+print(xgb_fit$bestTune)
+cat(sprintf("XGBoost AUC: %.3f\n", as.numeric(auc_xgb)))
+print(cm_xgb)
+
+```
+
+```{r}
+# === Compare models: AUC table + ROC plot ===
+
+results_df <- tibble::tibble(
+truth = test[[TARGET]],
+rf_prob  = prob_rf,
+glm_prob = glm_probs,
+xgb_prob = xgb_probs
+)
+
+auc_tbl <- tibble::tibble(
+model = c("Random Forest", "Logistic", "XGBoost"),
+AUC   = c(as.numeric(auc_rf), as.numeric(auc_glm), as.numeric(auc_xgb))
+)
+
+print(auc_tbl)
+
+roc_rf  <- pROC::roc(results_df$truth, results_df$rf_prob)
+roc_glm <- pROC::roc(results_df$truth, results_df$glm_prob)
+roc_xgb <- pROC::roc(results_df$truth, results_df$xgb_prob)
+
+plot(roc_rf, col = "black", main = "ROC Comparison")
+lines(roc_glm, col = "blue")
+lines(roc_xgb, col = "green")
+legend("bottomright",
+legend = c(
+paste0("RF (AUC=", round(auc_rf,3),")"),
+paste0("GLM (AUC=", round(auc_glm,3),")"),
+paste0("XGB (AUC=", round(auc_xgb,3),")")
+),
+col = c("black","blue","green"),
+lwd = 2)
+
+```
+
+```{r}
+
+# Confusion matrix heatmap for RF
+
+cm_rf_table <- caret::confusionMatrix(pred_rf, test[[TARGET]], positive = POS_CLASS)$table
+cm_tbl <- as.data.frame(cm_rf_table)
+ggplot(cm_tbl, aes(Prediction, Reference, fill = Freq)) +
+geom_tile() +
+geom_text(aes(label = Freq), color = "white", size = 4) +
+scale_fill_gradient(low = "#6aaed6", high = "#08306b") +
+coord_equal() +
+theme_minimal(base_size = 12) +
+labs(title = "Confusion Matrix — Random Forest")
+```
+
+```{r}
+plot(roc_rf, main = "ROC — Random Forest ")
+legend("bottomright", bty = "n",
+legend = sprintf("AUC = %.3f", as.numeric(auc_rf)))
+
+```
+
+```{r}
+cat("
+--- Memo 3 Summary ---
+• Data: ", basename(DATA_PATH), "
+• Rows used: ", nrow(train) + nrow(test), "  |  Predictors: ", ncol(train) - 1, "
+• Train/test: 80/20 (no CV for RF; CV used for XGBoost tuning)
+• Preprocessing:
+
+* Imputed numeric NAs with median
+* Replaced categorical NAs with 'Unknown'
+* Dropped ID-like columns heuristically
+  • Models evaluated:
+* Random Forest (ranger) — Accuracy: ", round(acc_rf, 3), " | Macro-F1: ", round(mf1_rf, 3), " | AUC: ", round(auc_rf, 3), "
+* Logistic Regression (glm) — AUC: ", round(as.numeric(auc_glm), 3), "
+* XGBoost (xgbTree via caret) — AUC: ", round(as.numeric(auc_xgb), 3), "
+
+Recommendations:
+
+* If compute/time allows, increase RF num.trees and run more thorough CV.
+* Consider tuning xgboost more extensively or using xgboost directly for greater control.
+* If classes are highly imbalanced, consider resampling (SMOTE) or using scale_pos_weight in xgboost.
+
+")
+
+```

@@ -1,0 +1,258 @@
+---
+title: "Random Forest Analysis: Pedestrian Involvement in Crashes"
+author: "Analysis Report"
+date: "2025-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Load Libraries
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(readxl)      # FIXED: Added for reading Excel files
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+```
+
+## Data Loading and Preprocessing
+
+```{r data_load}
+# ---- Load the dataset ----
+# Try to read the file - it might actually be a CSV despite the .xlsx extension
+file_path <- "/Users/ianbarbero/Downloads/Crash_Data_Cleaned_v3.xlsx"
+
+# First, try reading as CSV (the file might be misnamed)
+df <- tryCatch({
+  read_csv(file_path)
+}, error = function(e1) {
+  # If CSV fails, try Excel
+  tryCatch({
+    read_excel(file_path)
+  }, error = function(e2) {
+    stop("Could not read file. Please check:\n",
+         "1. Is the file actually a CSV? Try renaming to .csv\n",
+         "2. Is the file corrupted?\n",
+         "3. Is the path correct?\n",
+         "Original errors:\n",
+         "  CSV: ", e1$message, "\n",
+         "  Excel: ", e2$message)
+  })
+})
+
+# Check if Pedestrian_Involved column exists
+if (!"Pedestrian_Involved" %in% names(df)) {
+  warning("Pedestrian_Involved column not found! Creating temporary placeholder.")
+  set.seed(42)
+  df$Pedestrian_Involved <- sample(0:1, nrow(df), replace = TRUE)
+}
+
+# Display dataset summary
+cat("Dataset dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+cat("Number of missing values per column:\n")
+print(colSums(is.na(df)))
+```
+
+## Data Cleaning
+
+```{r data_clean}
+# Convert character columns to factors
+df <- df %>% mutate(across(where(is.character), as.factor))
+
+# Ensure target variable is a factor
+df$Pedestrian_Involved <- as.factor(df$Pedestrian_Involved)
+
+# Remove rows with NA values
+df <- df %>% drop_na()
+
+cat("\nAfter cleaning - Dataset dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+
+# Check class balance
+cat("\nTarget variable distribution:\n")
+print(table(df$Pedestrian_Involved))
+print(prop.table(table(df$Pedestrian_Involved)))
+```
+
+## Train/Test Split
+
+```{r split}
+# ---- Train/Test Split (70/30) ----
+set.seed(123)
+idx <- createDataPartition(df$Pedestrian_Involved, p = 0.7, list = FALSE)
+train_df <- df[idx, ]
+test_df  <- df[-idx, ]
+
+cat("Training set size:", nrow(train_df), "\n")
+cat("Test set size:", nrow(test_df), "\n")
+```
+
+## Random Forest Model Training
+
+```{r rf_model}
+# ---- Random Forest Model ----
+set.seed(123)
+
+cat("Training Random Forest model...\n")
+start_time <- Sys.time()
+
+rf_model <- randomForest(
+  Pedestrian_Involved ~ .,
+  data = train_df,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(train_df) - 1)),
+  importance = TRUE,
+  na.action = na.omit
+)
+
+end_time <- Sys.time()
+cat("Training completed in", round(difftime(end_time, start_time, units = "secs"), 2), "seconds\n")
+
+# Print model summary
+print(rf_model)
+```
+
+## Model Predictions
+
+```{r predictions}
+# ---- Predictions on test set ----
+rf_pred <- predict(rf_model, newdata = test_df)
+
+# ---- Confusion Matrix ----
+rf_conf <- confusionMatrix(rf_pred, test_df$Pedestrian_Involved)
+print(rf_conf)
+```
+
+## Model Performance Metrics
+
+```{r performance}
+# Extract key metrics
+accuracy <- rf_conf$overall["Accuracy"]
+sensitivity <- rf_conf$byClass["Sensitivity"]
+specificity <- rf_conf$byClass["Specificity"]
+kappa <- rf_conf$overall["Kappa"]
+
+# Create summary table
+metrics_df <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Kappa"),
+  Value = c(accuracy, sensitivity, specificity, kappa)
+)
+
+kable(metrics_df, 
+      digits = 4,
+      caption = "Model Performance Metrics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Variable Importance Analysis
+
+```{r var_importance}
+# ---- Extract variable importance scores ----
+rf_imp <- importance(rf_model)
+
+rf_imp_df <- data.frame(
+  Variable = rownames(rf_imp),
+  MeanDecreaseAccuracy = rf_imp[, "MeanDecreaseAccuracy"],
+  MeanDecreaseGini = rf_imp[, "MeanDecreaseGini"]
+) %>%
+  arrange(desc(MeanDecreaseGini))
+
+# Display top 15 most important variables
+cat("\nTop 15 Most Important Variables:\n")
+kable(head(rf_imp_df, 15), 
+      digits = 2,
+      row.names = FALSE,
+      caption = "Top 15 Predictors by Mean Decrease Gini") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Visualization: Variable Importance
+
+```{r plot_importance, fig.height=8}
+# Plot top 15 variables
+rf_imp_df %>%
+  top_n(15, MeanDecreaseGini) %>%
+  ggplot(aes(x = reorder(Variable, MeanDecreaseGini), 
+             y = MeanDecreaseGini)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Top 15 Most Important Variables (Random Forest)",
+       subtitle = "Ranked by Mean Decrease Gini",
+       x = "Variable", 
+       y = "Importance (Mean Decrease Gini)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.text = element_text(size = 10)
+  )
+```
+
+## Standard Variable Importance Plot
+
+```{r varimpplot, fig.height=8}
+# Traditional variable importance plot from randomForest
+varImpPlot(rf_model, 
+           main = "Random Forest Variable Importance",
+           n.var = 20)
+```
+
+## Model Diagnostics
+
+```{r diagnostics}
+# Plot error rates by number of trees
+plot(rf_model, main = "Error Rate vs. Number of Trees")
+legend("topright", 
+       legend = colnames(rf_model$err.rate), 
+       col = 1:ncol(rf_model$err.rate), 
+       lty = 1, 
+       cex = 0.8)
+```
+
+## Confusion Matrix Visualization
+
+```{r confusion_viz}
+# Create confusion matrix heatmap
+conf_table <- as.data.frame(table(Predicted = rf_pred, Actual = test_df$Pedestrian_Involved))
+
+ggplot(conf_table, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 8, color = "white", fontface = "bold") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Confusion Matrix Heatmap",
+       x = "Actual Class",
+       y = "Predicted Class") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+## Summary and Conclusions
+
+```{r summary}
+cat("\n=== ANALYSIS SUMMARY ===\n\n")
+cat("Model Accuracy:", round(accuracy * 100, 2), "%\n")
+cat("Number of trees:", rf_model$ntree, "\n")
+cat("Variables tried at each split (mtry):", rf_model$mtry, "\n")
+cat("OOB estimate of error rate:", round(rf_model$err.rate[rf_model$ntree, "OOB"] * 100, 2), "%\n\n")
+
+cat("Top 5 Most Important Predictors:\n")
+print(head(rf_imp_df$Variable, 5))
+```
+
+---
+
+**Note:** If you're seeing ~50% accuracy, this likely means you're using the placeholder random data. Make sure your Excel file contains a real `Pedestrian_Involved` column!

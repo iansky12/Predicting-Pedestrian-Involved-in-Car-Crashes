@@ -1,0 +1,97 @@
+---
+title: "Memo 3 Ready"
+output: html_document
+date: "2025-11-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+```
+
+
+```{r libs, include=FALSE}
+library(tidyverse)     # this gives you %>% 
+library(caret)
+library(randomForest)
+library(class)
+library(ggplot2)
+```
+
+
+
+```{r rf_setup}
+# ---- Load the dataset ----
+df <- readr::read_csv("/Users/ianbarbero/Downloads/Crash_Data_Cleaned_v3.xlsx")
+
+# TEMP: create a fake target until the real one exists
+set.seed(42)
+df$Pedestrian_Involved <- sample(0:1, nrow(df), replace = TRUE)
+
+# Convert all character columns to factors
+df <- df %>% mutate(across(where(is.character), as.factor))
+df$Pedestrian_Involved <- as.factor(df$Pedestrian_Involved)
+
+#removing rows with NA 
+df <- df %>% drop_na()
+df$Pedestrian_Involved <- as.factor(df$Pedestrian_Involved)
+
+# ---- Train/Test Split ----
+set.seed(123)
+idx <- createDataPartition(df$Pedestrian_Involved, p = 0.7, list = FALSE)
+train_df <- df[idx, ]
+test_df  <- df[-idx, ]
+
+# ---- Random Forest Model ----
+set.seed(123)
+rf_model <- randomForest(
+  Pedestrian_Involved ~ .,
+  data = train_df,
+  ntree = 500,
+  mtry = sqrt(ncol(train_df) - 1),
+  importance = TRUE
+)
+
+# ---- Predictions ----
+rf_pred <- predict(rf_model, newdata = test_df)
+
+# ---- Confusion Matrix ----
+confusionMatrix(rf_pred, test_df$Pedestrian_Involved)
+
+# ---- Variable Importance ----
+varImpPlot(rf_model, main = "Random Forest Variable Importance")
+```
+
+
+```{r rf_summary}
+# ---- Accuracy as a numeric value ----
+rf_conf <- confusionMatrix(rf_pred, test_df$Pedestrian_Involved)
+rf_accuracy <- rf_conf$overall["Accuracy"]
+rf_accuracy
+
+# ---- Extract variable importance scores ----
+rf_imp <- importance(rf_model)
+rf_imp_df <- data.frame(
+  Variable = rownames(rf_imp),
+  MeanDecreaseGini = rf_imp[, "MeanDecreaseGini"]
+) %>%
+  arrange(desc(MeanDecreaseGini))
+
+# View top 15 most important predictors
+head(rf_imp_df, 15)
+
+# Optional: plot top variables using ggplot
+library(ggplot2)
+rf_imp_df %>%
+  top_n(15, MeanDecreaseGini) %>%
+  ggplot(aes(x = reorder(Variable, MeanDecreaseGini), 
+             y = MeanDecreaseGini)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 Most Important Variables (Random Forest)",
+       x = "Variable", y = "Importance (Mean Decrease Gini)")
+```
